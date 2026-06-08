@@ -1,0 +1,114 @@
+# ai-terminal
+
+Local, free, context-aware AI terminal for zsh. Press **Ctrl+G**, type a query in plain English, get the actual result. All inference runs locally via [Ollama](https://ollama.com) — no cloud APIs, no API keys.
+
+```
+$ <empty prompt>          # press Ctrl+G
+$ ai show me last 10 logs here
+[ai] » git log -n 10 --oneline
+713f29d second
+097676e first
+```
+
+## What it does
+
+- **Ctrl+G on empty prompt** → seeds `ai ` prefix. Type natural language, hit Enter → agentic loop.
+- **Ctrl+G on non-empty prompt** → one-shot: replaces buffer with a shell command suggestion.
+- **Context-aware**: probes `pwd`, OS, git repo state (branch, status), `ls` before asking the model. "Last 10 logs here" in a git repo → `git log -n 10`. In a non-git dir → `tail` of newest `.log`.
+- **Agentic loop**: model can request `RUN: <cmd>` to gather data, then `ANSWER:` with the real result. Up to 4 iterations.
+- **Safety filter**: blocks `rm`, `sudo`, `mv`, `chmod`, redirects, `git push/reset/commit`, `curl|sh`, etc. in any RUN. ANSWER text is shown only, never executed.
+
+## Components
+
+| Component | Purpose |
+|---|---|
+| `ollama` | Local LLM runtime (Homebrew) |
+| `qwen2.5-coder:7b` | Default model (~4.7 GB) |
+| `shell-gpt` (sgpt) | CLI bridge, configured for Ollama via LiteLLM |
+| `ai-terminal.plugin.zsh` | Widget + agentic loop + helpers |
+
+## Install
+
+```bash
+git clone <this-repo> ~/sm-project/ai-terminal
+cd ~/sm-project/ai-terminal
+./install.sh
+```
+
+The installer is **idempotent** — re-run it any time. It will:
+
+1. Install ollama + pipx via Homebrew (if missing).
+2. Start the ollama service.
+3. Pull `qwen2.5-coder:7b` (override via `AI_TERMINAL_MODEL=...`).
+4. Install `shell-gpt[litellm]` via pipx.
+5. Write `~/.config/shell_gpt/.sgptrc`.
+6. Patch `~/.zshrc` with a guarded block that sources the plugin.
+7. Back up `~/.zshrc` to `~/.zshrc.bak.<timestamp>` first.
+
+Then restart your shell (or `source ~/.zshrc`).
+
+### Smaller / faster model
+
+```bash
+AI_TERMINAL_MODEL=qwen2.5-coder:3b ./install.sh
+```
+
+## Usage
+
+| Action | Result |
+|---|---|
+| Empty prompt + **Ctrl+G** | Inserts `ai ` prefix |
+| Type query, **Enter** | Runs agentic loop |
+| Non-empty prompt + **Ctrl+G** | Single-shot buffer rewrite (original sgpt behavior) |
+| `ai <query>` | Same as above without the hotkey |
+| `explain <cmd>` | Describe what a command does |
+| `fix` | Re-run last command, ask AI for a corrected one |
+| `aictx` | Print the context the loop sees (debug) |
+
+### Environment knobs
+
+| Var | Default | Effect |
+|---|---|---|
+| `AI_TERMINAL_MODEL` | `qwen2.5-coder:7b` | Model to pull/use (install time) |
+| `AI_MAX_ITERS` | `4` | Max RUN-iterations per `ai` call |
+
+## Files / layout
+
+```
+ai-terminal/
+├── README.md
+├── install.sh
+├── uninstall.sh
+├── ai-terminal.plugin.zsh     # sourced by ~/.zshrc
+└── config/
+    └── sgptrc.template
+```
+
+## Uninstall
+
+```bash
+./uninstall.sh
+```
+
+Removes the guarded block from `~/.zshrc` and the OMZ symlink. Does **not** remove ollama, the model, or sgpt — those may be used by other tools.
+
+## Cmd-key note (macOS)
+
+Terminals receive Ctrl-keys, not Cmd. To bind Cmd+K (or similar) to Ctrl+G:
+
+- **Terminal.app** → Settings → Profiles → Keyboard → Add: Key `⌘K`, Action "Send Text", value `\x07`.
+- **VS Code** `keybindings.json`:
+  ```json
+  { "key": "cmd+k", "command": "workbench.action.terminal.sendSequence",
+    "args": { "text": "" }, "when": "terminalFocus" }
+  ```
+
+## Safety
+
+- Read-only commands only inside RUN. Destructive patterns blocked by `_ai_safe`.
+- ANSWER text is printed, never executed. If the model proposes `rm -rf /` as an ANSWER, you see the text but nothing runs until you type it yourself and press Enter.
+- All inference local. No outbound API calls.
+
+## Tested on
+
+macOS 26 (Apple Silicon), zsh 5.9, ollama 0.24, shell-gpt 1.5.1.

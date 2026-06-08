@@ -1,0 +1,4 @@
+DEFAULT_MODEL=ollama/qwen2.5-coder:7b
+USE_LITELLM=true
+OPENAI_USE_FUNCTIONS=false
+OPENAI_API_KEY=local-dummy-key
