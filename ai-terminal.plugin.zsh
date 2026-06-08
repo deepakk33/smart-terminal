@@ -40,7 +40,23 @@ _ai_context() {
     out+="GIT_REPO: yes\n"
     out+="GIT_BRANCH: $(git branch --show-current 2>/dev/null)\n"
     out+="GIT_REMOTE: $(git remote -v 2>/dev/null | head -1 | awk '{print $2}')\n"
-    out+="GIT_STATUS_SHORT: $(git status --porcelain 2>/dev/null | head -5 | tr '\n' ';')\n"
+    local status_full
+    status_full=$(git status --porcelain 2>/dev/null | head -30)
+    out+="GIT_STATUS:\n${status_full}\n"
+    # Auto-expand untracked dirs so model doesn't have to discover.
+    local utdirs
+    utdirs=$(printf "%s\n" "$status_full" | awk '/^\?\? /{sub(/^\?\? /,""); print}' | head -10)
+    if [[ -n "$utdirs" ]]; then
+      out+="UNTRACKED_CONTENTS:\n"
+      while IFS= read -r p; do
+        [[ -z "$p" ]] && continue
+        if [[ -d "$p" ]]; then
+          out+="--- $p (dir) ---\n$(find "$p" -type f -maxdepth 3 2>/dev/null | head -20)\n"
+        elif [[ -f "$p" ]]; then
+          out+="--- $p (file) ---\n"
+        fi
+      done <<< "$utdirs"
+    fi
   else
     out+="GIT_REPO: no\n"
   fi
@@ -48,6 +64,87 @@ _ai_context() {
   printf "%b" "$out"
 }
 aictx() { _ai_context; }
+
+# --- Deterministic commit-message pipeline ---------------------------------
+# Skips agentic loop. Gathers ALL relevant git data in one pass, sends to model once.
+_ai_commit_msg() {
+  local query="$*"
+  if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    echo "[ai] not in a git repo"
+    return 1
+  fi
+  echo "[ai] gathering git state..."
+  local status_out diff_cached diff_unstaged untracked_files log_recent
+  status_out=$(git status --porcelain 2>&1 | head -100)
+  diff_cached=$(git diff --cached 2>&1 | head -400)
+  diff_unstaged=$(git diff 2>&1 | head -400)
+  log_recent=$(git log --oneline -n 10 2>&1)
+  # Untracked: file paths + a head of each text file
+  untracked_files=""
+  while IFS= read -r f; do
+    [[ -z "$f" ]] && continue
+    untracked_files+="--- ${f} ---\n"
+    if [[ -f "$f" ]]; then
+      file --brief --mime "$f" 2>/dev/null | grep -q "text/" \
+        && untracked_files+="$(head -30 "$f" 2>/dev/null)\n"
+    fi
+  done < <(git ls-files --others --exclude-standard 2>/dev/null | head -20)
+  local data="STATUS (--porcelain):
+${status_out:-(clean)}
+
+STAGED DIFF (git diff --cached):
+${diff_cached:-(none)}
+
+UNSTAGED DIFF (git diff):
+${diff_unstaged:-(none)}
+
+UNTRACKED FILES + HEADS:
+${untracked_files:-(none)}
+
+RECENT COMMIT STYLE (git log --oneline -n 10):
+${log_recent:-(none)}"
+  # Build explicit file checklist so model can't ignore items.
+  local checklist=""
+  local n=0
+  for f in ${(f)"$(git diff --cached --name-only 2>/dev/null)"}; do
+    [[ -z "$f" ]] && continue
+    ((n++)); checklist+="  ${n}. [staged] ${f}\n"
+  done
+  for f in ${(f)"$(git diff --name-only 2>/dev/null)"}; do
+    [[ -z "$f" ]] && continue
+    ((n++)); checklist+="  ${n}. [unstaged] ${f}\n"
+  done
+  for f in ${(f)"$(git ls-files --others --exclude-standard 2>/dev/null)"}; do
+    [[ -z "$f" ]] && continue
+    ((n++)); checklist+="  ${n}. [untracked] ${f}\n"
+  done
+  local prompt="You are a git commit-message generator.
+Below is the ACTUAL local repo state. Generate a Conventional Commits style message covering every change.
+
+CHANGES YOU MUST COVER (one bullet per item, do not skip any):
+${checklist:-  (none — repo is clean)}
+Total: ${n} change(s).
+
+Format:
+  <type>(<scope>): <subject ≤72 chars>
+  <blank line>
+  - bullet for item 1 (use real filename + what changed)
+  - bullet for item 2
+  ... (one bullet per CHANGES item above)
+
+Rules:
+- NO placeholders. NO '...'. Use the actual filenames and content shown in DATA.
+- Subject line: lowercase after the colon, no trailing period.
+- Match the repo's existing commit style if visible in RECENT COMMIT STYLE.
+- The body MUST have exactly ${n} bullet(s) — one per item in the CHANGES list above.
+- Output ONLY the commit message text — no preamble, no fenced code block.
+
+DATA:
+${data}
+
+USER REQUEST: ${query}"
+  printf "%s" "$prompt" | sgpt --no-interaction 2>/dev/null
+}
 
 # --- Safety filter ---------------------------------------------------------
 _ai_safe() {
@@ -84,6 +181,14 @@ ai() {
   if [[ -z "$query" ]]; then
     echo "Usage: ai <natural language query>"
     return 1
+  fi
+  # Intent shortcut: commit message generation has deterministic pipeline.
+  local q_lc="${query:l}"
+  if [[ "$q_lc" == *"commit msg"* || "$q_lc" == *"commit message"* \
+      || "$q_lc" == *"prepare"*"commit"* || "$q_lc" == *"write"*"commit"* \
+      || "$q_lc" == *"generate"*"commit"* ]]; then
+    _ai_commit_msg "$query"
+    return $?
   fi
   local ctx
   ctx=$(_ai_context)
@@ -169,6 +274,13 @@ USER QUERY: ${query}"
     if ! _ai_safe "$cmd"; then
       echo "[ai] blocked unsafe: $cmd"
       trace+="RUN_BLOCKED: $cmd
+"
+      ((i++)); continue
+    fi
+    # Dedupe: model sometimes re-emits an identical RUN. Reject and hint.
+    if [[ "$trace" == *"RUN: ${cmd}"$'\n'* ]]; then
+      echo "[ai] skip repeat: $cmd"
+      trace+="HINT: '${cmd}' already executed above. Choose a DIFFERENT command or emit ANSWER.
 "
       ((i++)); continue
     fi
