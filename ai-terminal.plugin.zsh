@@ -29,6 +29,105 @@ _ai_widget() {
 zle -N _ai_widget
 bindkey '^G' _ai_widget
 
+# --- Memory ----------------------------------------------------------------
+AI_MEM_DIR="${AI_MEM_DIR:-$HOME/.config/ai-terminal}"
+AI_MEM_GLOBAL="${AI_MEM_GLOBAL:-$AI_MEM_DIR/memory.md}"
+AI_MEM_MAX_LINES="${AI_MEM_MAX_LINES:-200}"
+
+_ai_mem_project_path() {
+  local root
+  root=$(git rev-parse --show-toplevel 2>/dev/null) || return 1
+  printf "%s/.ai-terminal.md" "$root"
+}
+
+_ai_mem_load() {
+  local out="" g p p_content=""
+  [[ -f "$AI_MEM_GLOBAL" ]] && g=$(cat "$AI_MEM_GLOBAL" 2>/dev/null)
+  p=$(_ai_mem_project_path 2>/dev/null) || true
+  [[ -n "$p" && -f "$p" ]] && p_content=$(cat "$p" 2>/dev/null)
+  [[ -n "$g" ]] && out+="GLOBAL MEMORY (apply to every query):
+${g}
+"
+  [[ -n "$p_content" ]] && out+="PROJECT MEMORY (apply when working in this repo):
+${p_content}
+"
+  printf "%s" "$out"
+}
+
+_ai_mem_remember() {
+  local scope=global text=""
+  if [[ "$1" == "project" ]]; then
+    scope=project; shift
+  fi
+  text="$*"
+  if [[ -z "$text" ]]; then
+    echo "Usage: ai [project] remember <fact>"
+    return 1
+  fi
+  local target
+  if [[ "$scope" == project ]]; then
+    target=$(_ai_mem_project_path 2>/dev/null) \
+      || { echo "[ai] not inside a git repo — cannot save project memory"; return 1; }
+  else
+    target="$AI_MEM_GLOBAL"
+  fi
+  mkdir -p "$(dirname "$target")"
+  printf -- "- %s (%s)\n" "$text" "$(date +%Y-%m-%d)" >> "$target"
+  # Cap file at AI_MEM_MAX_LINES (keep newest).
+  if (( $(wc -l < "$target") > AI_MEM_MAX_LINES )); then
+    tail -n "$AI_MEM_MAX_LINES" "$target" > "${target}.tmp" && mv "${target}.tmp" "$target"
+  fi
+  echo "[ai] remembered ($scope): $text"
+  echo "[ai] -> $target"
+}
+
+_ai_mem_show() {
+  echo "=== GLOBAL: $AI_MEM_GLOBAL ==="
+  if [[ -f "$AI_MEM_GLOBAL" ]]; then cat "$AI_MEM_GLOBAL"; else echo "(empty)"; fi
+  local p
+  p=$(_ai_mem_project_path 2>/dev/null) || true
+  if [[ -n "$p" ]]; then
+    echo
+    echo "=== PROJECT: $p ==="
+    if [[ -f "$p" ]]; then cat "$p"; else echo "(empty)"; fi
+  fi
+}
+
+_ai_mem_forget() {
+  local pattern="$*"
+  if [[ -z "$pattern" ]]; then
+    echo "Usage: ai forget <substring>"
+    return 1
+  fi
+  local removed=0 f before after
+  local files=("$AI_MEM_GLOBAL")
+  local p
+  p=$(_ai_mem_project_path 2>/dev/null) && files+=("$p")
+  for f in "${files[@]}"; do
+    [[ -z "$f" || ! -f "$f" ]] && continue
+    before=$(wc -l < "$f")
+    grep -v -F -- "$pattern" "$f" > "${f}.tmp" && mv "${f}.tmp" "$f"
+    after=$(wc -l < "$f")
+    if (( before > after )); then
+      removed=$(( removed + before - after ))
+      echo "[ai] removed $((before-after)) line(s) from $f"
+    fi
+  done
+  (( removed == 0 )) && echo "[ai] no matching lines"
+}
+
+# Auto-learn: extract LEARN: <fact> lines from a model response and persist them.
+_ai_mem_auto_extract() {
+  local resp="$1"
+  [[ "${AI_AUTO_LEARN:-0}" == "1" ]] || return 0
+  local fact
+  printf "%s" "$resp" | awk '/^LEARN:/{sub(/^LEARN: */,""); print}' | while IFS= read -r fact; do
+    [[ -z "$fact" ]] && continue
+    _ai_mem_remember "$fact" >/dev/null
+    echo "[ai] auto-learned: $fact"
+  done
+}
+
 # --- Context probe ---------------------------------------------------------
 _ai_context() {
   local out=""
@@ -118,8 +217,10 @@ ${log_recent:-(none)}"
     [[ -z "$f" ]] && continue
     ((n++)); checklist+="  ${n}. [untracked] ${f}\n"
   done
+  local mem
+  mem=$(_ai_mem_load)
   local prompt="You are a git commit-message generator.
-Below is the ACTUAL local repo state. Generate a Conventional Commits style message covering every change.
+${mem}Below is the ACTUAL local repo state. Generate a Conventional Commits style message covering every change.
 
 CHANGES YOU MUST COVER (one bullet per item, do not skip any):
 ${checklist:-  (none — repo is clean)}
@@ -151,12 +252,17 @@ _ai_safe() {
   local cmd="$1"
   local danger='(^|[ ;|&])(rm|sudo|dd|mkfs|mv|chmod|chown|kill|killall|shutdown|reboot|halt|truncate|tee)( |$)'
   local danger2='>[^|&>]|>>'
-  local danger3='git +(push|reset|commit|rebase|checkout|merge)'
+  local danger3='git +(push|reset|commit|rebase|checkout|merge|add|stash|tag|clone|fetch|pull)'
   local danger4='(curl|wget)[^|;]*\|[^|]*(sh|bash|zsh)'
+  # Package managers + anything that mutates the system. Block install/uninstall/update verbs broadly.
+  local danger5='(^|[ ;|&])(brew|apt|apt-get|yum|dnf|pacman|port|snap|pip|pip3|pipx|npm|yarn|pnpm|bun|gem|cargo|go) +(install|add|uninstall|remove|upgrade|update|reinstall|create|init|publish|link|unlink|global)'
+  local danger6='(^|[ ;|&])(make|cmake) +(install|clean|deploy)'
   [[ "$cmd" =~ $danger  ]] && return 1
   [[ "$cmd" =~ $danger2 ]] && return 1
   [[ "$cmd" =~ $danger3 ]] && return 1
   [[ "$cmd" =~ $danger4 ]] && return 1
+  [[ "$cmd" =~ $danger5 ]] && return 1
+  [[ "$cmd" =~ $danger6 ]] && return 1
   return 0
 }
 
@@ -177,9 +283,25 @@ _ai_extract_answer() {
 }
 
 ai() {
+  # Memory subcommands (dispatched before LLM).
+  case "$1" in
+    remember)          shift; _ai_mem_remember "$@"; return $? ;;
+    forget)            shift; _ai_mem_forget "$@"; return $? ;;
+    memory|recall|mem) _ai_mem_show; return 0 ;;
+    project)
+      if [[ "$2" == remember ]]; then
+        shift 2; _ai_mem_remember project "$@"; return $?
+      fi
+      ;;
+  esac
   local query="$*"
   if [[ -z "$query" ]]; then
-    echo "Usage: ai <natural language query>"
+    echo "Usage:"
+    echo "  ai <query>                   — agentic loop (Ctrl+G to seed)"
+    echo "  ai remember <fact>           — save to global memory"
+    echo "  ai project remember <fact>   — save to project memory"
+    echo "  ai memory                    — show memory"
+    echo "  ai forget <substring>        — remove matching lines"
     return 1
   fi
   # Intent shortcut: commit message generation has deterministic pipeline.
@@ -190,8 +312,9 @@ ai() {
     _ai_commit_msg "$query"
     return $?
   fi
-  local ctx
+  local ctx mem
   ctx=$(_ai_context)
+  mem=$(_ai_mem_load)
   local trace=""
   local max="${AI_MAX_ITERS:-6}"
   local out_lines="${AI_OUT_LINES:-200}"
@@ -239,7 +362,11 @@ Efficiency:
 Git hints (when relevant):
 - Staged diff: `git diff --cached` (NOT `git diff`).
 - Untracked dir contents: `ls -la <dir>` or `find <dir> -type f -maxdepth 3`.
-- Recent style: `git log --oneline -n 10` to match repo commit conventions.'
+- Recent style: `git log --oneline -n 10` to match repo commit conventions.
+
+Memory:
+- If GLOBAL/PROJECT MEMORY blocks appear above CONTEXT, treat them as binding facts/preferences. Honor them unless they contradict the user'\''s current query.
+- AUTO-LEARN (only if user shows a preference/correction): after ANSWER, on its own line, you MAY emit `LEARN: <one short fact in third person, e.g. "user prefers Conventional Commits with scope">`. Only emit when the fact is clearly worth saving across sessions. Never emit LEARN for transient details.'
   while (( i < max )); do
     # On final iteration, push model to ANSWER even if it wanted more RUNs.
     if (( i == max - 1 )); then
@@ -248,7 +375,7 @@ NOTE: This is the FINAL turn. You MUST emit ANSWER now using the TRACE you have.
     fi
     prompt="${sys}${final_hint}
 
-CONTEXT:
+${mem}CONTEXT:
 ${ctx}
 TRACE:
 ${trace:-(none)}
@@ -260,6 +387,7 @@ USER QUERY: ${query}"
     answer=$(_ai_extract_answer "$resp")
     if [[ -n "$answer" ]]; then
       printf "%s\n" "$answer"
+      _ai_mem_auto_extract "$resp"
       return 0
     fi
     cmd=$(_ai_extract_run "$resp")
@@ -314,6 +442,7 @@ FINAL: emit ANSWER ONLY using the TRACE above as ground truth. Do not emit RUN. 
   answer=$(_ai_extract_answer "$resp")
   if [[ -n "$answer" ]]; then
     printf "%s\n" "$answer"
+    _ai_mem_auto_extract "$resp"
     return 0
   fi
   # Last resort: print raw response (with ANSWER prefix stripped if present).

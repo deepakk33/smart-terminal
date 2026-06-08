@@ -61,16 +61,45 @@ AI_TERMINAL_MODEL=qwen2.5-coder:3b ./install.sh
 | Type query, **Enter** | Runs agentic loop |
 | Non-empty prompt + **Ctrl+G** | Single-shot buffer rewrite (original sgpt behavior) |
 | `ai <query>` | Same as above without the hotkey |
+| `ai remember <fact>` | Save fact to **global** memory (`~/.config/ai-terminal/memory.md`) |
+| `ai project remember <fact>` | Save fact to **project** memory (`<git-root>/.ai-terminal.md`) |
+| `ai memory` | Show global + project memory |
+| `ai forget <substring>` | Remove memory lines containing substring |
 | `explain <cmd>` | Describe what a command does |
 | `fix` | Re-run last command, ask AI for a corrected one |
 | `aictx` | Print the context the loop sees (debug) |
+
+### Memory
+
+Every `ai` call auto-injects both memory files into the model prompt. Use it to teach durable preferences:
+
+```bash
+ai remember user prefers Conventional Commits with scope, bullet body
+ai project remember dashboard uses Next.js 14 app router with TanStack Query
+ai prepare commit msg          # subject becomes feat(dashboard): ...
+```
+
+Memory locations:
+- Global: `~/.config/ai-terminal/memory.md` (always loaded)
+- Project: `<git-root>/.ai-terminal.md` (loaded when CWD is inside that repo)
+
+Each entry is a dated bullet. File is capped at `AI_MEM_MAX_LINES` (default 200, newest kept).
+
+**Auto-learn** (`AI_AUTO_LEARN=1`): model may emit `LEARN: <fact>` after ANSWER → appended to global memory automatically. Off by default.
 
 ### Environment knobs
 
 | Var | Default | Effect |
 |---|---|---|
 | `AI_TERMINAL_MODEL` | `qwen2.5-coder:7b` | Model to pull/use (install time) |
-| `AI_MAX_ITERS` | `4` | Max RUN-iterations per `ai` call |
+| `AI_MAX_ITERS` | `6` | Max RUN-iterations per `ai` call |
+| `AI_OUT_LINES` | `200` | Lines kept from each RUN output |
+| `AI_TRACE_CHARS` | `6000` | Trace size cap, oldest trimmed when over |
+| `AI_DEBUG` | `0` | `1` prints raw model response per iter |
+| `AI_AUTO_LEARN` | `0` | `1` extracts `LEARN:` lines into global memory |
+| `AI_MEM_DIR` | `~/.config/ai-terminal` | Memory dir |
+| `AI_MEM_GLOBAL` | `$AI_MEM_DIR/memory.md` | Global memory file path |
+| `AI_MEM_MAX_LINES` | `200` | Memory file size cap |
 
 ## Files / layout
 
