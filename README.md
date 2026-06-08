@@ -14,9 +14,25 @@ $ ai show me last 10 logs here
 
 - **Ctrl+G on empty prompt** → seeds `ai ` prefix. Type natural language, hit Enter → agentic loop.
 - **Ctrl+G on non-empty prompt** → one-shot: replaces buffer with a shell command suggestion.
-- **Context-aware**: probes `pwd`, OS, git repo state (branch, status), `ls` before asking the model. "Last 10 logs here" in a git repo → `git log -n 10`. In a non-git dir → `tail` of newest `.log`.
-- **Agentic loop**: model can request `RUN: <cmd>` to gather data, then `ANSWER:` with the real result. Up to 4 iterations.
-- **Safety filter**: blocks `rm`, `sudo`, `mv`, `chmod`, redirects, `git push/reset/commit`, `curl|sh`, etc. in any RUN. ANSWER text is shown only, never executed.
+- **Context-aware**: probes `pwd`, OS, git repo state (branch, status, **untracked dir contents**), `ls` before asking the model.
+- **Agentic loop** with three directives:
+  - `RUN:` — read-only inspection, auto-executed.
+  - `ACT:` — mutating action, classified into `confirm` / `destructive` / `blocked` → prompts y/n/always-this-session before running.
+  - `ANSWER:` — final synthesized text.
+- **Memory** (global + per-project) auto-injected into every prompt. `LEARN:` lines from model can be auto-saved (`AI_AUTO_LEARN=1`).
+- **Chat session** per terminal tab — follow-ups (`shorter`, `drop scope`, `you are wrong, try X`) compound on the prior assistant turn.
+- **Broad domain**: git, npm/pnpm/yarn/bun, brew, pip/pipx, aws/gcloud/az, docker/kubectl, psql/mongosh/redis-cli, curl/jq, lsof/ps — anything in `$PATH`. Model is instructed to detect tools via `command -v` and fall back gracefully.
+
+## Permission tiers
+
+| Class | Examples | Default behavior |
+|---|---|---|
+| safe | `ls`, `git status`, `cat`, `find`, `ps` | run silently as RUN |
+| confirm | `git add`, `git commit`, `git push`, `brew install`, `npm install`, `mv`, `chmod`, redirects | yellow prompt — y / always-this-session / n |
+| destructive | `rm -rf`, `git push --force`, `git reset --hard`, `drop table` | red prompt — same options, stronger warning |
+| blocked | `rm -rf /`, `sudo rm`, fork bombs, `dd of=/dev/sd*`, `chmod -R 777 /` | never executed, even with `yolo` |
+
+Override: `AI_PERMISSION=yolo` auto-approves `confirm` and `destructive` (does NOT bypass `blocked`).
 
 ## Components
 
@@ -127,6 +143,8 @@ Each entry is a dated bullet. File is capped at `AI_MEM_MAX_LINES` (default 200,
 | `AI_TRACE_CHARS` | `6000` | Trace size cap, oldest trimmed when over |
 | `AI_DEBUG` | `0` | `1` prints raw model response per iter |
 | `AI_AUTO_LEARN` | `0` | `1` extracts `LEARN:` lines into global memory |
+| `AI_PERMISSION` | `confirm` | `yolo` auto-approves ACT cmds (never bypasses `blocked`) |
+| `AI_TIPS` | `1` | `0` silences the startup tip line |
 | `AI_MEM_DIR` | `~/.config/ai-terminal` | Memory dir |
 | `AI_MEM_GLOBAL` | `$AI_MEM_DIR/memory.md` | Global memory file path |
 | `AI_MEM_MAX_LINES` | `200` | Memory file size cap |
@@ -141,7 +159,16 @@ ai-terminal/
 ├── README.md
 ├── install.sh
 ├── uninstall.sh
-├── ai-terminal.plugin.zsh     # sourced by ~/.zshrc
+├── ai-terminal.plugin.zsh         # loader — sources lib/*.zsh
+├── lib/
+│   ├── widget.zsh                 # Ctrl+G ZLE widget
+│   ├── chat.zsh                   # per-session conversation
+│   ├── memory.zsh                 # global + project memory
+│   ├── context.zsh                # env probe (OS, git, ls, untracked dirs)
+│   ├── safety.zsh                 # classifier + confirm + RUN gate
+│   ├── intents.zsh                # commit-msg + refinement pipelines
+│   ├── agent.zsh                  # ai() + agentic loop + extractors
+│   └── helpers.zsh                # explain, fix, startup tip
 └── config/
     └── sgptrc.template
 ```
