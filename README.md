@@ -61,6 +61,9 @@ AI_TERMINAL_MODEL=qwen2.5-coder:3b ./install.sh
 | Type query, **Enter** | Runs agentic loop |
 | Non-empty prompt + **Ctrl+G** | Single-shot buffer rewrite (original sgpt behavior) |
 | `ai <query>` | Same as above without the hotkey |
+| `ai <follow-up feedback>` | Refines the previous assistant turn (auto-detected) |
+| `ai new` / `ai reset` | Reset chat session (archives prior turns) |
+| `ai history` / `ai chat` | Show chat turns for current session |
 | `ai remember <fact>` | Save fact to **global** memory (`~/.config/ai-terminal/memory.md`) |
 | `ai project remember <fact>` | Save fact to **project** memory (`<git-root>/.ai-terminal.md`) |
 | `ai memory` | Show global + project memory |
@@ -68,6 +71,33 @@ AI_TERMINAL_MODEL=qwen2.5-coder:3b ./install.sh
 | `explain <cmd>` | Describe what a command does |
 | `fix` | Re-run last command, ask AI for a corrected one |
 | `aictx` | Print the context the loop sees (debug) |
+
+### Chat / follow-ups
+
+Each terminal tab has its own chat session (keyed by parent shell PID), stored at `~/.config/ai-terminal/sessions/chat-<id>.md`. Every turn (user query + assistant response) is appended automatically.
+
+```bash
+ai prepare commit msg
+# feat(dashboard): add greeting.txt and update project documentation
+#  • added greeting.txt ...
+#  • created .ai-terminal.md ...
+#  • added .claude/skills/diagram/README.md ...
+#  • included feat-assets/logo.svg ...
+
+ai subject too long, max 50 chars and drop the scope
+# feat: add greeting.txt and update project documentation
+#  • ... (bullets preserved)
+
+ai keep only 2 bullets
+ai use imperative verbs, not past tense
+# feat: add greeting.txt and update project documentation
+#  • Add greeting.txt with initial content "hello world"
+#  • Create .ai-terminal.md with project overview
+```
+
+Follow-up detection auto-fires when chat has a prior assistant turn AND the new query looks like feedback ("shorter", "drop", "use", "instead", "make it", "you are doing wrong", etc.). Refinements compound — each turn builds on the last.
+
+Knobs: `AI_CHAT_MAX_TURNS` (default 10), `AI_CHAT_DIR` (default `~/.config/ai-terminal/sessions`).
 
 ### Memory
 
@@ -100,6 +130,9 @@ Each entry is a dated bullet. File is capped at `AI_MEM_MAX_LINES` (default 200,
 | `AI_MEM_DIR` | `~/.config/ai-terminal` | Memory dir |
 | `AI_MEM_GLOBAL` | `$AI_MEM_DIR/memory.md` | Global memory file path |
 | `AI_MEM_MAX_LINES` | `200` | Memory file size cap |
+| `AI_CHAT_DIR` | `~/.config/ai-terminal/sessions` | Chat session dir |
+| `AI_CHAT_MAX_TURNS` | `10` | Max turn-pairs kept per session |
+| `AI_CHAT_ID` | `$PPID` | Session identifier (per terminal tab) |
 
 ## Files / layout
 

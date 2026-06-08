@@ -29,6 +29,67 @@ _ai_widget() {
 zle -N _ai_widget
 bindkey '^G' _ai_widget
 
+# --- Chat session (per-terminal follow-up context) -------------------------
+AI_CHAT_DIR="${AI_CHAT_DIR:-$HOME/.config/ai-terminal/sessions}"
+AI_CHAT_ID="${AI_CHAT_ID:-$PPID}"
+AI_CHAT_MAX_TURNS="${AI_CHAT_MAX_TURNS:-10}"
+
+_ai_chat_path() { printf "%s/chat-%s.md" "$AI_CHAT_DIR" "$AI_CHAT_ID"; }
+
+_ai_chat_load() {
+  local p
+  p=$(_ai_chat_path)
+  [[ -f "$p" ]] || return 0
+  local content
+  content=$(cat "$p" 2>/dev/null)
+  [[ -z "$content" ]] && return 0
+  printf "CONVERSATION SO FAR (prior turns this session — use as context for follow-ups):\n%s\n\n" "$content"
+}
+
+_ai_chat_append() {
+  local role="$1"; shift
+  local text="$*"
+  local p
+  p=$(_ai_chat_path)
+  mkdir -p "$(dirname "$p")"
+  printf -- "[%s]\n%s\n\n" "$role" "$text" >> "$p"
+  # Cap at last AI_CHAT_MAX_TURNS * 2 entries (user + assistant per turn).
+  local total
+  total=$(grep -c "^\[" "$p" 2>/dev/null || echo 0)
+  if (( total > AI_CHAT_MAX_TURNS * 2 )); then
+    local keep=$((AI_CHAT_MAX_TURNS * 2))
+    awk -v keep="$keep" '
+      /^\[/ { entries[++c] = NR }
+      { lines[NR] = $0; last = NR }
+      END {
+        start = entries[c - keep + 1]
+        if (!start) start = 1
+        for (i = start; i <= last; i++) print lines[i]
+      }
+    ' "$p" > "${p}.tmp" && mv "${p}.tmp" "$p"
+  fi
+}
+
+_ai_chat_show() {
+  local p
+  p=$(_ai_chat_path)
+  echo "=== CHAT: $p ==="
+  if [[ -f "$p" ]]; then cat "$p"; else echo "(empty — no turns yet this session)"; fi
+}
+
+_ai_chat_reset() {
+  local p
+  p=$(_ai_chat_path)
+  if [[ -f "$p" ]]; then
+    local ts
+    ts=$(date +%Y%m%d-%H%M%S)
+    mv "$p" "${p}.archived-${ts}"
+    echo "[ai] chat reset (archived: ${p}.archived-${ts})"
+  else
+    echo "[ai] no chat to reset"
+  fi
+}
+
 # --- Memory ----------------------------------------------------------------
 AI_MEM_DIR="${AI_MEM_DIR:-$HOME/.config/ai-terminal}"
 AI_MEM_GLOBAL="${AI_MEM_GLOBAL:-$AI_MEM_DIR/memory.md}"
@@ -164,6 +225,75 @@ _ai_context() {
 }
 aictx() { _ai_context; }
 
+# --- Refinement: follow-up on prior assistant turn -------------------------
+_ai_is_refinement() {
+  local q="${1:l}"
+  local p
+  p=$(_ai_chat_path)
+  [[ -f "$p" ]] || return 1
+  # Require a prior [assistant] turn.
+  grep -q "^\[assistant\]" "$p" 2>/dev/null || return 1
+  case "$q" in
+    *"too long"*|*"too short"*|*"shorter"*|*"longer"*|*"instead"*|\
+    *"drop "*|*"remove "*|*"add "*|*"change "*|*"rewrite"*|*"redo"*|\
+    *"try again"*|*"make it"*|*"use "*|*"don't "*|*"do not "*|\
+    *"that's wrong"*|*"thats wrong"*|*"thats not right"*|*"that's not right"*|\
+    *"you are doing wrong"*|*"you're wrong"*|*"refine"*|*"revise"*|\
+    *"shorten"*|*"lengthen"*|*"simpler"*|*"more detail"*|*"less detail"*|\
+    *"no scope"*|*"with scope"*|*"without "*|*"only "*|*"keep only"*)
+      return 0 ;;
+  esac
+  return 1
+}
+
+# Extract content of the LAST [assistant] block from chat file (text after [assistant] up to next [user] or EOF).
+_ai_chat_last_assistant() {
+  local p
+  p=$(_ai_chat_path)
+  [[ -f "$p" ]] || return 1
+  awk '
+    /^\[assistant\]/ { start=NR; capture=1; buf=""; next }
+    /^\[user\]/      { capture=0 }
+    capture          { buf = buf $0 ORS }
+    END              { printf "%s", buf }
+  ' "$p"
+}
+
+_ai_refine() {
+  local query="$*"
+  local mem prior
+  mem=$(_ai_mem_load)
+  prior=$(_ai_chat_last_assistant)
+  if [[ -z "$prior" ]]; then
+    echo "[ai] no prior assistant turn to refine"
+    return 1
+  fi
+  local prompt="You are revising your PREVIOUS output based on user feedback.
+
+${mem}PREVIOUS OUTPUT (verbatim — this is what you produced last turn):
+---
+${prior}
+---
+
+USER FEEDBACK on that output: ${query}
+
+Task: produce a new version of PREVIOUS OUTPUT with the feedback applied.
+
+Rules:
+- Reproduce the FULL structure of PREVIOUS OUTPUT (subject + body + bullets + code blocks). Do not collapse a multi-line artifact to a single line unless the user explicitly asks.
+- Apply the feedback exactly. \"drop the scope\" -> delete (scope) parenthetical. \"max 50 chars\" -> count chars. \"imperative verbs\" -> rewrite as add/create/update/etc.
+- Output ONLY the revised artifact. No preamble. No \"here is\". No rules text. No code fences. Stop immediately after the artifact."
+  local result
+  result=$(printf "%s" "$prompt" | sgpt --no-interaction 2>/dev/null)
+  # Strip anything past a chat-template token leak.
+  result="${result%%<|im_start|>*}"
+  result="${result%%<|im_end|>*}"
+  result="${result%%USER FEEDBACK:*}"
+  printf "%s\n" "$result"
+  _ai_chat_append user "$query"
+  _ai_chat_append assistant "$result"
+}
+
 # --- Deterministic commit-message pipeline ---------------------------------
 # Skips agentic loop. Gathers ALL relevant git data in one pass, sends to model once.
 _ai_commit_msg() {
@@ -217,10 +347,12 @@ ${log_recent:-(none)}"
     [[ -z "$f" ]] && continue
     ((n++)); checklist+="  ${n}. [untracked] ${f}\n"
   done
-  local mem
+  local mem chat
   mem=$(_ai_mem_load)
+  chat=$(_ai_chat_load)
   local prompt="You are a git commit-message generator.
-${mem}Below is the ACTUAL local repo state. Generate a Conventional Commits style message covering every change.
+${mem}${chat}Below is the ACTUAL local repo state. Generate a Conventional Commits style message covering every change.
+If CONVERSATION SO FAR contains a previous commit-message attempt plus user feedback, REVISE per the feedback — do not start from scratch.
 
 CHANGES YOU MUST COVER (one bullet per item, do not skip any):
 ${checklist:-  (none — repo is clean)}
@@ -244,7 +376,11 @@ DATA:
 ${data}
 
 USER REQUEST: ${query}"
-  printf "%s" "$prompt" | sgpt --no-interaction 2>/dev/null
+  local result
+  result=$(printf "%s" "$prompt" | sgpt --no-interaction 2>/dev/null)
+  printf "%s\n" "$result"
+  _ai_chat_append user "$query"
+  _ai_chat_append assistant "$result"
 }
 
 # --- Safety filter ---------------------------------------------------------
@@ -283,11 +419,13 @@ _ai_extract_answer() {
 }
 
 ai() {
-  # Memory subcommands (dispatched before LLM).
+  # Memory + chat subcommands (dispatched before LLM).
   case "$1" in
     remember)          shift; _ai_mem_remember "$@"; return $? ;;
     forget)            shift; _ai_mem_forget "$@"; return $? ;;
     memory|recall|mem) _ai_mem_show; return 0 ;;
+    new|reset|end)     _ai_chat_reset; return 0 ;;
+    history|chat)      _ai_chat_show; return 0 ;;
     project)
       if [[ "$2" == remember ]]; then
         shift 2; _ai_mem_remember project "$@"; return $?
@@ -302,19 +440,28 @@ ai() {
     echo "  ai project remember <fact>   — save to project memory"
     echo "  ai memory                    — show memory"
     echo "  ai forget <substring>        — remove matching lines"
+    echo "  ai history                   — show current chat session"
+    echo "  ai new                       — reset chat session (archived)"
     return 1
   fi
-  # Intent shortcut: commit message generation has deterministic pipeline.
+  # Intent dispatch.
   local q_lc="${query:l}"
+  # 1) Refinement of prior assistant turn (only when chat has one).
+  if _ai_is_refinement "$query"; then
+    _ai_refine "$query"
+    return $?
+  fi
+  # 2) Commit-message generation has deterministic pipeline.
   if [[ "$q_lc" == *"commit msg"* || "$q_lc" == *"commit message"* \
       || "$q_lc" == *"prepare"*"commit"* || "$q_lc" == *"write"*"commit"* \
       || "$q_lc" == *"generate"*"commit"* ]]; then
     _ai_commit_msg "$query"
     return $?
   fi
-  local ctx mem
+  local ctx mem chat
   ctx=$(_ai_context)
   mem=$(_ai_mem_load)
+  chat=$(_ai_chat_load)
   local trace=""
   local max="${AI_MAX_ITERS:-6}"
   local out_lines="${AI_OUT_LINES:-200}"
@@ -375,7 +522,7 @@ NOTE: This is the FINAL turn. You MUST emit ANSWER now using the TRACE you have.
     fi
     prompt="${sys}${final_hint}
 
-${mem}CONTEXT:
+${mem}${chat}CONTEXT:
 ${ctx}
 TRACE:
 ${trace:-(none)}
@@ -387,6 +534,8 @@ USER QUERY: ${query}"
     answer=$(_ai_extract_answer "$resp")
     if [[ -n "$answer" ]]; then
       printf "%s\n" "$answer"
+      _ai_chat_append user "$query"
+      _ai_chat_append assistant "$answer"
       _ai_mem_auto_extract "$resp"
       return 0
     fi
@@ -442,11 +591,16 @@ FINAL: emit ANSWER ONLY using the TRACE above as ground truth. Do not emit RUN. 
   answer=$(_ai_extract_answer "$resp")
   if [[ -n "$answer" ]]; then
     printf "%s\n" "$answer"
+    _ai_chat_append user "$query"
+    _ai_chat_append assistant "$answer"
     _ai_mem_auto_extract "$resp"
     return 0
   fi
   # Last resort: print raw response (with ANSWER prefix stripped if present).
-  printf "%s\n" "${resp#ANSWER:}"
+  local fallback="${resp#ANSWER:}"
+  printf "%s\n" "$fallback"
+  _ai_chat_append user "$query"
+  _ai_chat_append assistant "$fallback"
   return 2
 }
 
